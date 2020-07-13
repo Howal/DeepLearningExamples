@@ -53,6 +53,7 @@ from apex.amp import _amp_state
 
 import dllogger
 from concurrent.futures import ProcessPoolExecutor
+from azureml.core.run import Run
 
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -573,7 +574,8 @@ def main():
 
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init)
 
-                train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+                #train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+                train_iter = train_dataloader
 
                 if raw_train_start is None:
                     raw_train_start = time.time()
@@ -621,6 +623,7 @@ def main():
                             dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
                                                                             "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
                                                                             "learning_rate": optimizer.param_groups[0]['lr']})
+                            run.log_row("train loss over steps", global_step = global_step, loss =  np.float(loss.item()))
                         average_loss = 0
 
                     if global_step >= args.max_steps or training_steps % (
@@ -664,7 +667,7 @@ def main():
 
 
 if __name__ == "__main__":
-
+    run = Run.get_context()
     now = time.time()
     args, final_loss, train_time_raw, global_step = main()
     gpu_count = args.n_gpu
