@@ -43,7 +43,7 @@ from apex.optimizers import FusedLAMB
 from schedulers import PolyWarmUpScheduler
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from utils import is_main_process, format_step, get_world_size, get_rank
+from utils import is_main_process, format_step, get_world_size, get_rank, get_local_rank
 from apex.parallel import DistributedDataParallel as DDP
 from schedulers import LinearWarmUpScheduler
 from apex.parallel.distributed import flat_dist_call
@@ -483,8 +483,8 @@ def main():
 
     args = parse_arguments()
 
-    if args.use_env and 'LOCAL_RANK' in os.environ:
-        args.local_rank = int(os.environ['LOCAL_RANK'])
+    if args.use_env:
+        args.local_rank = get_local_rank()
         
     random.seed(args.seed + args.local_rank)
     np.random.seed(args.seed + args.local_rank)
