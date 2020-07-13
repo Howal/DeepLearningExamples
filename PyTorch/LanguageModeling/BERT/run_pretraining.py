@@ -339,6 +339,8 @@ def prepare_model_and_optimizer(args, device):
 
     modeling.ACT2FN["bias_gelu"] = torch.jit.script(modeling.ACT2FN["bias_gelu"])
     model = modeling.BertForPreTraining(config)
+    if is_main_process():
+        print(model)
 
     checkpoint = None
     if not args.resume_from_checkpoint:

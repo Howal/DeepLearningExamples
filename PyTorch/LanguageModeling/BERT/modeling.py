@@ -132,6 +132,9 @@ def swish(x):
 
 ACT2FN = {"gelu": gelu, "bias_gelu": bias_gelu, "bias_tanh": bias_tanh, "relu": torch.nn.functional.relu, "swish": swish}
 
+def str2bool(val):
+    return val.lower() == "true" or val.lower() == "t" or val.lower() == "1"
+
 class LinearActivation(Module):
     r"""Fused Linear and activation Module.
     """
@@ -194,7 +197,11 @@ class BertConfig(object):
                  max_position_embeddings=512,
                  type_vocab_size=2,
                  initializer_range=0.02,
-                 output_all_encoded_layers=False):
+                 output_all_encoded_layers=False,
+                 use_dnl='False',
+                 split_value='False',
+                 keep_mean='False',
+                 dnl_scale=1.0):
         """Constructs BertConfig.
 
         Args:
@@ -238,6 +245,10 @@ class BertConfig(object):
             self.type_vocab_size = type_vocab_size
             self.initializer_range = initializer_range
             self.output_all_encoded_layers = output_all_encoded_layers
+            self.use_dnl = str2bool(use_dnl)
+            self.split_value = str2bool(split_value)
+            self.keep_mean = str2bool(keep_mean)
+            self.dnl_scale = dnl_scale
         else:
             raise ValueError("First argument must be either a vocabulary size (int)"
                              "or the path to a pretrained model config file (str)")
@@ -406,6 +417,127 @@ class BertSelfAttention(nn.Module):
         return context_layer
 
 
+class BertSelfAttentionDNL(nn.Module):
+    def __init__(self, config):
+        super(BertSelfAttentionDNL, self).__init__()
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                "The hidden size (%d) is not a multiple of the number of attention "
+                "heads (%d)" % (config.hidden_size, config.num_attention_heads))
+        self.split_value = config.split_value
+        self.dnl_scale = config.dnl_scale
+        self.keep_mean = config.keep_mean
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(
+            config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        if self.split_value:
+            self.gc_value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.gc = nn.Linear(config.hidden_size, self.num_attention_heads)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[
+            :-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def transpose_key_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = torch.reshape(x, new_x_shape)
+        return x.permute(0, 2, 3, 1)
+
+    def forward(self, hidden_states, attention_mask):
+        # N x L x H (L=sequence_len, H=h*k, h=attention_head_size, k=num_attention_heads)
+        mixed_query_layer = self.query(hidden_states)
+        mixed_key_layer = self.key(hidden_states)
+        mixed_value_layer = self.value(hidden_states)
+
+        # N x k x L x h
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        key_layer = self.transpose_key_for_scores(mixed_key_layer)
+        value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        # apply mask
+        # N x 1 x L x 1
+        attention_mask_t = 1.0 - (attention_mask.permute(0, 1, 3, 2) / 10000.0)
+
+        # N x 1 x 1 x 1
+        attention_mask_t_count = attention_mask_t.sum(2, keepdim=True) * self.attention_head_size
+        # TODO: assume attention_mask should always be larger than 0
+        attention_mask_t_count[attention_mask_t_count==0.0] = 1.0
+
+        if not self.keep_mean:
+            # N x k x 1 x 1
+            query_mean = (query_layer * attention_mask_t).sum(3, keepdim=True).sum(2, keepdim=True) / attention_mask_t_count
+            key_mean = (key_layer * attention_mask_t).sum(3, keepdim=True).sum(2, keepdim=True) / attention_mask_t_count
+
+            # N x k x L x h
+            query_layer = query_layer - query_mean
+            key_layer = key_layer - key_mean
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        # N x k x L x L
+        attention_scores = torch.matmul(query_layer, key_layer)
+        ###
+        # attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        ###
+        attention_scores = attention_scores * self.dnl_scale
+
+        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+        # N x 1 x 1 x L
+        # 0.0 for pos we need, -10000 for pos we ignore
+        attention_scores = attention_scores + attention_mask
+
+        # Normalize the attention scores to probabilities.
+        # N x k x L x L
+        attention_probs = F.softmax(attention_scores, dim=-1)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(attention_probs)
+
+        # N x k x L x h
+        context_layer = torch.matmul(attention_probs, value_layer)
+        # N x L x k x h
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        # N x L x H
+        new_context_layer_shape = context_layer.size()[
+            :-2] + (self.all_head_size,)
+        context_layer = torch.reshape(context_layer, new_context_layer_shape)
+
+        ### GC part ###
+        if self.split_value:
+            mixed_gc_value_layer = self.value(hidden_states)
+            gc_value_layer = self.transpose_for_scores(mixed_gc_value_layer)
+        else:
+            gc_value_layer = value_layer
+        # N x L x k
+        gc_score = self.gc(hidden_states)
+
+        # N x k x L
+        gc_score = gc_score.permute(0, 2, 1)
+        gc_score = F.softmax(gc_score, dim=-1)
+
+        # TODO: do we need dropout for gc_score?
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        gc_score = self.dropout(gc_score)
+
+        # N x k x h
+        gc_layer = torch.matmul(gc_score.unsqueeze(2), gc_value_layer).squeeze()
+        # N x 1 x H
+        new_gc_layer_shape = gc_layer.size()[:-2] + (1, self.all_head_size)
+        gc_layer = torch.reshape(gc_layer, new_gc_layer_shape)
+
+        return context_layer + gc_layer
+
+
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
@@ -423,11 +555,18 @@ class BertSelfOutput(nn.Module):
 class BertAttention(nn.Module):
     def __init__(self, config):
         super(BertAttention, self).__init__()
-        self.self = BertSelfAttention(config)
+        self.use_dnl = config.use_dnl
+        if config.use_dnl:
+            self.self_dnl = BertSelfAttentionDNL(config)
+        else:
+            self.self = BertSelfAttention(config) 
         self.output = BertSelfOutput(config)
 
     def forward(self, input_tensor, attention_mask):
-        self_output = self.self(input_tensor, attention_mask)
+        if self.use_dnl:
+            self_output = self.self_dnl(input_tensor, attention_mask)
+        else:
+            self_output = self.self(input_tensor, attention_mask)
         attention_output = self.output(self_output, input_tensor)
         return attention_output
 
