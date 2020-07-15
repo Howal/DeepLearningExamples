@@ -43,7 +43,7 @@ from apex.optimizers import FusedLAMB
 from schedulers import PolyWarmUpScheduler
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from utils import is_main_process, format_step, get_world_size, get_rank, get_local_rank
+from utils import is_main_process, format_step, get_world_size, get_local_size, get_rank, get_local_rank, set_environment_variables_for_nccl_backend
 from apex.parallel import DistributedDataParallel as DDP
 from schedulers import LinearWarmUpScheduler
 from apex.parallel.distributed import flat_dist_call
@@ -280,6 +280,7 @@ def parse_arguments():
 def setup_training(args):
 
     assert (torch.cuda.is_available())
+    set_environment_variables_for_nccl_backend(get_local_size() == get_world_size())
 
     if args.local_rank == -1:
         device = torch.device("cuda")
@@ -625,7 +626,7 @@ def main():
                             dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
                                                                             "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
                                                                             "learning_rate": optimizer.param_groups[0]['lr']})
-                            run.log_row("train loss over steps", global_step = global_step, loss =  np.float(loss.item()))
+                            run.log_row("train loss over steps", global_step = global_step + args.phase1_end_step if args.phase2 else global_step, loss =  np.float(average_loss / (args.log_freq * divisor)))
                         average_loss = 0
 
                     if global_step >= args.max_steps or training_steps % (
